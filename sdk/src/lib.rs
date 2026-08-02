@@ -416,6 +416,27 @@ pub trait Resize: sealed::Sealed {
     /// already borrowed. The caller must guarantee that there are no active
     /// borrows to the account data.
     unsafe fn resize_unchecked(&mut self, new_len: usize) -> Result<(), ProgramError>;
+
+    /// Resize (either truncating or zero extending) the account's data without
+    /// zeroing the newly added bytes.
+    ///
+    /// The account data can be increased by up to
+    /// [`MAX_PERMITTED_DATA_INCREASE`] bytes within an instruction.
+    ///
+    /// # Important
+    ///
+    /// This method makes assumptions about the layout and location of memory
+    /// referenced by `RuntimeAccount` fields. It should only be called for
+    /// instances of `AccountView` that were created by the runtime and received
+    /// in the `process_instruction` entrypoint of a program.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because it does not check if the account data is
+    /// already borrowed and it does not zero the new bytes. The caller must
+    /// guarantee that there are no active borrows to the account data and that
+    /// the newly grown bytes are written before being read.
+    unsafe fn resize_uninit(&mut self, new_len: usize) -> Result<(), ProgramError>;
 }
 
 #[cfg(all(feature = "unsafe-account-resize", not(feature = "account-resize")))]
@@ -445,6 +466,34 @@ pub trait UnsafeResize: sealed::Sealed {
     /// resizing an account after a cross-program invocation, since the
     /// account data may have been resized by the invoked program.
     unsafe fn resize(&mut self, new_len: usize);
+
+    /// Resize (either truncating or zero extending) the account's data without
+    /// zeroing the newly added bytes.
+    ///
+    /// The account data can be increased by up to
+    /// [`MAX_PERMITTED_DATA_INCREASE`] bytes within an instruction.
+    ///
+    /// # Important
+    ///
+    /// This method makes assumptions about the layout and location of memory
+    /// referenced by `RuntimeAccount` fields. It should only be called for
+    /// instances of `AccountView` that were created by the runtime and received
+    /// in the `process_instruction` entrypoint of a program.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because it does not check if the account data is
+    /// already borrowed, it does not validate the `new_len` against the maximum
+    /// permitted data increase and it does not zero the new bytes.
+    ///
+    /// The caller must guarantee that there are no active borrows to the
+    /// account data, that the `new_len` is valid and that the newly grown bytes
+    /// are written before being read. Resizing an account beyond
+    /// [`MAX_PERMITTED_DATA_INCREASE`] leads to out-of-bounds memory accesses
+    /// and undefined behavior. Particular care must be taken when resizing an
+    /// account after a cross-program invocation, since the account data may
+    /// have been resized by the invoked program.
+    unsafe fn resize_uninit(&mut self, new_len: usize);
 }
 
 // Only AccountView is "sealed", so only it can implement `Resize`.
@@ -460,55 +509,77 @@ impl Resize for AccountView {
         unsafe { self.resize_unchecked(new_len) }
     }
 
-    #[allow(clippy::arithmetic_side_effects)]
     unsafe fn resize_unchecked(&mut self, new_len: usize) -> Result<(), ProgramError> {
-        // Return early if length hasn't changed.
-        if new_len == self.data_len() {
-            return Ok(());
+        resize_inner(self, new_len, true)
+    }
+
+    unsafe fn resize_uninit(&mut self, new_len: usize) -> Result<(), ProgramError> {
+        resize_inner(self, new_len, false)
+    }
+}
+
+#[cfg(feature = "account-resize")]
+#[allow(clippy::arithmetic_side_effects)]
+unsafe fn resize_inner(
+    account: &mut AccountView,
+    new_len: usize,
+    zero_fill: bool,
+) -> Result<(), ProgramError> {
+    if new_len == account.data_len() {
+        return Ok(());
+    }
+
+    let runtime_account = account.account_ptr() as *mut RuntimeAccount;
+    let original_data_len = u32::from_le_bytes(unsafe { (*runtime_account).padding }) as usize;
+
+    // Return early if the length increase from the original serialized data
+    // length is too large and would result in an out-of-bounds allocation.
+    if new_len.saturating_sub(original_data_len) > MAX_PERMITTED_DATA_INCREASE {
+        return Err(ProgramError::InvalidRealloc);
+    }
+
+    if zero_fill && new_len > account.data_len() {
+        unsafe {
+            write_bytes(
+                account.data_mut_ptr().add(account.data_len()),
+                0,
+                new_len - account.data_len(),
+            );
         }
+    }
 
-        let account = self.account_ptr() as *mut RuntimeAccount;
-        let original_data_len = u32::from_le_bytes(unsafe { (*account).padding }) as usize;
-        // Return early if the length increase from the original serialized data
-        // length is too large and would result in an out-of-bounds allocation.
-        if new_len.saturating_sub(original_data_len) > MAX_PERMITTED_DATA_INCREASE {
-            return Err(ProgramError::InvalidRealloc);
-        }
+    unsafe { (*runtime_account).data_len = new_len as u64 };
 
-        if new_len > self.data_len() {
-            unsafe {
-                write_bytes(
-                    self.data_mut_ptr().add(self.data_len()),
-                    0,
-                    new_len - self.data_len(),
-                );
-            }
-        }
+    Ok(())
+}
 
-        unsafe { (*account).data_len = new_len as u64 };
+#[cfg(all(feature = "unsafe-account-resize", not(feature = "account-resize")))]
+impl UnsafeResize for AccountView {
+    unsafe fn resize(&mut self, new_len: usize) {
+        unsafe { resize_inner_unchecked(self, new_len, true) }
+    }
 
-        Ok(())
+    unsafe fn resize_uninit(&mut self, new_len: usize) {
+        unsafe { resize_inner_unchecked(self, new_len, false) }
     }
 }
 
 #[cfg(all(feature = "unsafe-account-resize", not(feature = "account-resize")))]
 #[allow(clippy::arithmetic_side_effects)]
-impl UnsafeResize for AccountView {
-    unsafe fn resize(&mut self, new_len: usize) {
-        let account = self.account_ptr() as *mut solana_account_view::RuntimeAccount;
+unsafe fn resize_inner_unchecked(account: &mut AccountView, new_len: usize, zero_fill: bool) {
+    let runtime_account = account.account_ptr() as *mut solana_account_view::RuntimeAccount;
 
-        if new_len > self.data_len() {
-            unsafe {
-                core::ptr::write_bytes(
-                    self.data_mut_ptr().add(self.data_len()),
-                    0,
-                    new_len - self.data_len(),
-                );
-            }
+    if zero_fill && new_len > account.data_len() {
+        unsafe {
+            core::ptr::write_bytes(
+                account.data_mut_ptr().add(account.data_len()),
+                0,
+                new_len - account.data_len(),
+            );
         }
-
-        unsafe { (*account).data_len = new_len as u64 };
     }
+
+    unsafe { (*runtime_account).data_len = new_len as u64 };
 }
 
 // Not `pub`, so other crates cannot name nor implement its trait.
@@ -627,5 +698,76 @@ mod tests {
 
         let data = account.try_borrow().unwrap();
         assert_eq!(data.len(), 500);
+    }
+
+    #[test]
+    fn test_resize_uninit() {
+        // 8-bytes aligned account data.
+        let mut data = [0u64; 100 * size_of::<u64>()];
+
+        // Set the borrow state.
+        data[0] = NOT_BORROWED as u64;
+        // Set the initial data length to 100.
+        //
+        // (dup_marker, signer, writable, executable and padding)
+        data[0] = u64::from_le_bytes([255, 0, 0, 0, 100, 0, 0, 0]);
+        // `data_len`
+        data[10] = 100;
+
+        let runtime_account = data.as_mut_ptr() as *mut RuntimeAccount;
+        // SAFETY: `runtime_account` points to a valid in-memory account layout
+        // for the duration of this test.
+        let mut account = unsafe { AccountView::new_unchecked(runtime_account) };
+
+        assert_eq!(account.data_len(), 100);
+
+        // Fill the area beyond the current data length with a non-zero value so
+        // we can verify that `resize_uninit` does not zero the new bytes.
+        let fill = 0xABu8;
+        unsafe {
+            write_bytes(account.data_mut_ptr().add(100), fill, 100);
+        }
+
+        // Increase the size without zeroing the new bytes.
+        unsafe {
+            account.resize_uninit(200).unwrap();
+        }
+
+        assert_eq!(account.data_len(), 200);
+
+        {
+            // The new bytes should not have been zeroed.
+            let data = account.try_borrow().unwrap();
+            assert!(data[100..200].iter().all(|b| *b == fill));
+        }
+
+        // Decrease the size.
+        unsafe {
+            account.resize_uninit(0).unwrap();
+        }
+
+        assert_eq!(account.data_len(), 0);
+
+        // Invalid resize.
+        let invalid_resize = unsafe { account.resize_uninit(10_000_000_001) };
+        assert!(invalid_resize.is_err());
+
+        // Reset to its original size.
+        unsafe {
+            account.resize_uninit(100).unwrap();
+        }
+
+        assert_eq!(account.data_len(), 100);
+
+        // The checked `resize` still zeroes the new bytes.
+        account.resize(200).unwrap();
+
+        assert_eq!(account.data_len(), 200);
+
+        {
+            // The new bytes should have been zeroed by `resize`.
+            let data = account.try_borrow().unwrap();
+            assert!(data[100..200].iter().all(|b| *b == 0));
+        }
     }
 }
